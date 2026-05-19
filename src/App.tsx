@@ -1,22 +1,39 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
-import type { AI, Card, Status } from './types';
-import { AIS, AI_COLORS, MOCK_QUESTIONS } from './types';
+import type { Card, Status, Message } from './types';
+import {
+  MOCK_FIRST_QUESTIONS,
+  MOCK_FOLLOWUP_QUESTIONS,
+  initialAIMessage,
+  finalAIMessage,
+} from './types';
 import { ensureNotificationPermission, notify } from './notifications';
 import './App.css';
 
 const WORKING_TO_HITL_MS = 3000;
-const HITL_TO_DONE_MS = 3000;
+const WORKING_TO_DONE_MS = 3000;
+const TURNS_BEFORE_DONE = 2;
 
-function pickAI(): AI {
-  return AIS[Math.floor(Math.random() * AIS.length)];
+function pickFirstQuestion(): string {
+  return MOCK_FIRST_QUESTIONS[Math.floor(Math.random() * MOCK_FIRST_QUESTIONS.length)];
 }
 
-function pickQuestion(): string {
-  return MOCK_QUESTIONS[Math.floor(Math.random() * MOCK_QUESTIONS.length)];
+function pickFollowup(): string {
+  return MOCK_FOLLOWUP_QUESTIONS[Math.floor(Math.random() * MOCK_FOLLOWUP_QUESTIONS.length)];
 }
 
-function newId(): string {
-  return `card_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+function newId(prefix: string): string {
+  return `${prefix}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+}
+
+function makeMessage(sender: Message['sender'], text: string): Message {
+  return { id: newId('msg'), sender, text, timestamp: Date.now() };
+}
+
+function lastAIQuestion(messages: Message[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].sender === 'ai') return messages[i].text;
+  }
+  return null;
 }
 
 const COLUMNS: { status: Status; label: string; sublabel: string }[] = [
@@ -29,13 +46,11 @@ export default function App() {
   const [cards, setCards] = useState<Card[]>([]);
   const [input, setInput] = useState('');
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [response, setResponse] = useState('');
-  const [notifPermission, setNotifPermission] = useState<NotificationPermission>('default');
+  const [draft, setDraft] = useState('');
+  const [notifPermission, setNotifPermission] = useState<NotificationPermission>(() =>
+    'Notification' in window ? Notification.permission : 'default'
+  );
   const timers = useRef<Map<string, number>>(new Map());
-
-  useEffect(() => {
-    if ('Notification' in window) setNotifPermission(Notification.permission);
-  }, []);
 
   const clearTimer = (id: string) => {
     const t = timers.current.get(id);
@@ -45,55 +60,91 @@ export default function App() {
     }
   };
 
-  const transitionTo = useCallback((id: string, status: Status) => {
-    setCards((prev) => prev.map((c) => (c.id === id ? { ...c, status } : c)));
-  }, []);
+  // Working → HITL: AI가 질문을 던지고 카드를 HITL 상태로
+  const scheduleAIQuestion = useCallback(
+    (card: Card, isFollowup: boolean) => {
+      clearTimer(card.id);
+      const t = window.setTimeout(() => {
+        const question = isFollowup ? pickFollowup() : pickFirstQuestion();
+        setCards((prev) =>
+          prev.map((c) =>
+            c.id !== card.id
+              ? c
+              : { ...c, status: 'HITL', messages: [...c.messages, makeMessage('ai', question)] }
+          )
+        );
+        notify('판단이 필요한 카드가 있어요', `"${card.title}" — ${question}`);
+      }, WORKING_TO_HITL_MS);
+      timers.current.set(card.id, t);
+    },
+    []
+  );
 
-  const scheduleWorkingToHitl = useCallback((card: Card) => {
+  // Working → Done: AI가 마지막 메시지를 남기고 카드를 Done으로
+  const scheduleFinalize = useCallback((card: Card) => {
     clearTimer(card.id);
     const t = window.setTimeout(() => {
-      transitionTo(card.id, 'HITL');
-      notify(`${card.ai}이(가) 판단을 기다리고 있어요`, `"${card.title}" — ${card.question}`);
-    }, WORKING_TO_HITL_MS);
+      setCards((prev) =>
+        prev.map((c) =>
+          c.id !== card.id
+            ? c
+            : { ...c, status: 'done', messages: [...c.messages, makeMessage('ai', finalAIMessage(card.title))] }
+        )
+      );
+    }, WORKING_TO_DONE_MS);
     timers.current.set(card.id, t);
-  }, [transitionTo]);
+  }, []);
 
-  const scheduleHitlToDone = useCallback((id: string) => {
-    clearTimer(id);
-    const t = window.setTimeout(() => transitionTo(id, 'done'), HITL_TO_DONE_MS);
-    timers.current.set(id, t);
-  }, [transitionTo]);
-
-  const addCard = () => {
-    const title = input.trim();
+  const addCard = (titleArg?: string) => {
+    const title = (titleArg ?? input).trim();
     if (!title) return;
     const card: Card = {
-      id: newId(),
+      id: newId('card'),
       title,
-      ai: pickAI(),
       status: 'working',
-      question: pickQuestion(),
+      messages: [makeMessage('ai', initialAIMessage(title))],
+      turn: 0,
       createdAt: Date.now(),
     };
     setCards((prev) => [card, ...prev]);
-    setInput('');
-    scheduleWorkingToHitl(card);
+    if (!titleArg) setInput('');
+    scheduleAIQuestion(card, false);
   };
 
-  const handleRespond = (id: string) => {
-    if (!response.trim()) return;
+  const handleSend = (cardId: string) => {
+    const text = draft.trim();
+    if (!text) return;
+    const card = cards.find((c) => c.id === cardId);
+    if (!card) return;
+
+    // 사용자 메시지 추가 + 상태를 working으로
     setCards((prev) =>
-      prev.map((c) => (c.id === id ? { ...c, status: 'working', userResponse: response.trim() } : c))
+      prev.map((c) =>
+        c.id === cardId
+          ? {
+              ...c,
+              status: 'working',
+              messages: [...c.messages, makeMessage('user', text)],
+              turn: c.turn + 1,
+            }
+          : c
+      )
     );
-    setResponse('');
-    setSelectedId(null);
-    scheduleHitlToDone(id);
+    setDraft('');
+
+    const nextTurn = card.turn + 1;
+    if (nextTurn >= TURNS_BEFORE_DONE) {
+      scheduleFinalize(card);
+    } else {
+      scheduleAIQuestion(card, true);
+    }
   };
 
   useEffect(() => {
+    const captured = timers.current;
     return () => {
-      timers.current.forEach((t) => window.clearTimeout(t));
-      timers.current.clear();
+      captured.forEach((t) => window.clearTimeout(t));
+      captured.clear();
     };
   }, []);
 
@@ -108,24 +159,36 @@ export default function App() {
     const seeds = ['PKM 노트 정리', '회의록 정리', '요구사항 정의서 작성'];
     seeds.forEach((title, idx) => {
       const card: Card = {
-        id: newId(),
+        id: newId('card'),
         title,
-        ai: AIS[idx % AIS.length],
         status: 'working',
-        question: pickQuestion(),
+        messages: [makeMessage('ai', initialAIMessage(title))],
+        turn: 0,
         createdAt: Date.now() + idx,
       };
       setCards((prev) => [card, ...prev]);
-      scheduleWorkingToHitl(card);
+      scheduleAIQuestion(card, false);
     });
+  };
+
+  // 카드 미리보기에 마지막 AI 질문 한 줄 노출
+  const cardPreview = (c: Card): string | null => {
+    if (c.status === 'HITL') return lastAIQuestion(c.messages);
+    if (c.status === 'done') {
+      const lastUser = [...c.messages].reverse().find((m) => m.sender === 'user');
+      return lastUser ? `↳ ${lastUser.text}` : null;
+    }
+    return null;
   };
 
   return (
     <div className="app">
       <header className="header">
         <div className="header-left">
-          <h1>HID v0.1 — Task Card Flow</h1>
-          <p className="subtitle">대화 시퀀스 → 태스크 카드. 작업판 위의 병렬 AI 위임.</p>
+          <h1>HID v0.2 — Task Card Flow</h1>
+          <p className="subtitle">
+            대화 시퀀스 → 태스크 카드. 카드 한 장이 곧 멀티턴 대화 컨테이너.
+          </p>
         </div>
         <div className="header-right">
           {notifPermission !== 'granted' && (
@@ -149,7 +212,7 @@ export default function App() {
           placeholder="새 태스크를 입력하세요 (예: PKM 노트 정리)"
           className="task-input"
         />
-        <button className="btn-primary" onClick={addCard}>
+        <button className="btn-primary" onClick={() => addCard()}>
           분배
         </button>
       </div>
@@ -167,28 +230,33 @@ export default function App() {
               </div>
               <div className="column-body">
                 {colCards.length === 0 && <div className="empty">—</div>}
-                {colCards.map((c) => (
-                  <button
-                    key={c.id}
-                    className={`card card-${c.status}`}
-                    onClick={() => setSelectedId(c.id)}
-                  >
-                    <div className="card-top">
-                      <span className="ai-chip" style={{ background: AI_COLORS[c.ai] }}>
-                        {c.ai}
-                      </span>
-                      {c.status === 'working' && <span className="dot-pulse" aria-hidden />}
-                      {c.status === 'HITL' && <span className="hitl-badge">판단 필요</span>}
-                    </div>
-                    <div className="card-title">{c.title}</div>
-                    {c.status === 'HITL' && c.question && (
-                      <div className="card-q">{c.question}</div>
-                    )}
-                    {c.status === 'done' && c.userResponse && (
-                      <div className="card-resp">↳ {c.userResponse}</div>
-                    )}
-                  </button>
-                ))}
+                {colCards.map((c) => {
+                  const preview = cardPreview(c);
+                  return (
+                    <button
+                      key={c.id}
+                      className={`card card-${c.status}`}
+                      onClick={() => {
+                        setSelectedId(c.id);
+                        setDraft('');
+                      }}
+                    >
+                      <div className="card-top">
+                        <span className="turn-chip">turn {c.turn + 1}</span>
+                        {c.status === 'working' && <span className="dot-pulse" aria-hidden />}
+                        {c.status === 'HITL' && <span className="hitl-badge">판단 필요</span>}
+                        {c.status === 'done' && <span className="done-badge">완료</span>}
+                      </div>
+                      <div className="card-title">{c.title}</div>
+                      {preview && (
+                        <div className={c.status === 'HITL' ? 'card-q' : 'card-resp'}>
+                          {preview}
+                        </div>
+                      )}
+                      <div className="card-meta">메시지 {c.messages.length}개</div>
+                    </button>
+                  );
+                })}
               </div>
             </div>
           );
@@ -197,61 +265,70 @@ export default function App() {
 
       {selected && (
         <div className="modal-backdrop" onClick={() => setSelectedId(null)}>
-          <div className="modal" onClick={(e) => e.stopPropagation()}>
+          <div className="modal chat-modal" onClick={(e) => e.stopPropagation()}>
             <div className="modal-head">
-              <span className="ai-chip" style={{ background: AI_COLORS[selected.ai] }}>
-                {selected.ai}
-              </span>
+              <h2 className="modal-title">{selected.title}</h2>
               <span className={`status-tag status-${selected.status}`}>{selected.status}</span>
             </div>
-            <h2 className="modal-title">{selected.title}</h2>
-            {selected.status === 'HITL' && (
-              <>
-                <div className="modal-q">
-                  <strong>{selected.ai}의 질문</strong>
-                  <p>{selected.question}</p>
+            <div className="chat-thread" aria-live="polite">
+              {selected.messages.map((m) => (
+                <div key={m.id} className={`bubble bubble-${m.sender}`}>
+                  <div className="bubble-sender">{m.sender === 'ai' ? 'AI' : '나'}</div>
+                  <div className="bubble-text">{m.text}</div>
                 </div>
-                <textarea
-                  value={response}
-                  onChange={(e) => setResponse(e.target.value)}
-                  placeholder="여기에 응답을 입력하세요…"
-                  rows={3}
-                  className="response-input"
-                />
-                <div className="modal-actions">
-                  <button className="btn-secondary" onClick={() => setSelectedId(null)}>
-                    닫기
-                  </button>
-                  <button className="btn-primary" onClick={() => handleRespond(selected.id)}>
-                    응답 → 진행 재개
-                  </button>
+              ))}
+              {selected.status === 'working' && (
+                <div className="bubble bubble-ai bubble-typing">
+                  <div className="bubble-sender">AI</div>
+                  <div className="bubble-text">
+                    <span className="dot-pulse" aria-hidden />
+                    <span className="dot-pulse" aria-hidden />
+                    <span className="dot-pulse" aria-hidden />
+                  </div>
                 </div>
-              </>
-            )}
-            {selected.status === 'working' && (
-              <p className="modal-info">백그라운드에서 진행 중입니다. 잠시 후 판단이 필요해질 수 있어요.</p>
-            )}
-            {selected.status === 'done' && (
-              <>
-                {selected.userResponse && (
-                  <p className="modal-info">
-                    내 응답: <em>{selected.userResponse}</em>
-                  </p>
-                )}
-                <p className="modal-info">완료된 작업입니다.</p>
-                <div className="modal-actions">
-                  <button className="btn-secondary" onClick={() => setSelectedId(null)}>
-                    닫기
-                  </button>
-                </div>
-              </>
-            )}
+              )}
+            </div>
+
+            <div className="chat-input-row">
+              <textarea
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    if (selected.status === 'HITL') handleSend(selected.id);
+                  }
+                }}
+                placeholder={
+                  selected.status === 'HITL'
+                    ? '메시지를 입력하세요 (Enter 전송, Shift+Enter 줄바꿈)'
+                    : selected.status === 'working'
+                    ? 'AI가 처리 중입니다. 잠시 후 질문이 도착해요.'
+                    : '완료된 작업입니다. 대화 이력은 카드에 그대로 보존됩니다.'
+                }
+                rows={2}
+                disabled={selected.status !== 'HITL'}
+                className="chat-input"
+              />
+              <button
+                className="btn-primary"
+                disabled={selected.status !== 'HITL' || !draft.trim()}
+                onClick={() => handleSend(selected.id)}
+              >
+                전송
+              </button>
+            </div>
+            <div className="modal-actions">
+              <button className="btn-secondary" onClick={() => setSelectedId(null)}>
+                닫기
+              </button>
+            </div>
           </div>
         </div>
       )}
 
       <footer className="footer">
-        <span>v0.1 · 행위-반응 쌍 3개 (생성 · HITL · 응답)</span>
+        <span>v0.2 · 카드 = 멀티턴 대화 컨테이너</span>
         <span>마찰 3차원 시연: 🌐 분산 · 🌙 비동기 · ⚡ 이벤트</span>
       </footer>
     </div>
